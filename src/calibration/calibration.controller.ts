@@ -1,15 +1,48 @@
 // src/calibration/calibration.controller.ts
+import { Controller, Post, Get, UseInterceptors, UploadedFile, Body, Query } from '@nestjs/common';
+import { FileInterceptor } from '@nestjs/platform-express';
+import { ApiTags, ApiConsumes, ApiBody } from '@nestjs/swagger';
+import { CalibrationService } from './calibration.service';
+import type { Express } from 'express';
+
+// Export the interface so it can be used
+export interface CalibrationChange {
+  label: string;
+  value: number;
+  sourceA2l?: string;
+}
+
+@ApiTags('calibration')
 @Controller('calibration')
 export class CalibrationController {
   constructor(private readonly calibrationService: CalibrationService) {}
 
-  @Get('available')
-  async getAvailableCalibrations(@Query('a2lPaths') a2lPaths: string[]) {
-    return this.calibrationService.getCalibrationsFromMultipleA2ls(a2lPaths);
-  }
-
   @Post('modify')
   @UseInterceptors(FileInterceptor('file'))
+  @ApiConsumes('multipart/form-data')
+  @ApiBody({
+    schema: {
+      type: 'object',
+      properties: {
+        file: { type: 'string', format: 'binary' },
+        matchedA2ls: {
+          type: 'array',
+          items: { type: 'string' }
+        },
+        changes: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              label: { type: 'string' },
+              value: { type: 'number' },
+              sourceA2l: { type: 'string' }
+            }
+          }
+        }
+      }
+    }
+  })
   async modifyCalibrations(
     @UploadedFile() file: Express.Multer.File,
     @Body() body: {
@@ -23,12 +56,15 @@ export class CalibrationController {
       changes: body.changes,
     });
 
-    // Return the patched file
     return {
       success: true,
       report: result.report,
-      // In a real implementation, you'd stream the binary as a download
       patchedSize: result.patched.length,
     };
+  }
+
+  @Get('available')
+  async getAvailableCalibrations(@Query('a2lPaths') a2lPaths: string[]) {
+    return this.calibrationService.getCalibrationsFromMultipleA2ls(a2lPaths);
   }
 }

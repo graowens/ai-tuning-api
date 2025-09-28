@@ -2,6 +2,7 @@
 import { Injectable, BadRequestException } from '@nestjs/common';
 import { A2lIndexService } from '../a2l-index/a2l-index.service';
 
+
 // Add this type definition
 type ByteOrder = 'MSB_FIRST' | 'MSB_LAST';
 
@@ -10,7 +11,8 @@ interface CalibrationSource {
   labels: string[];
 }
 
-interface CalibrationChange {
+// Export this interface so it can be used in the controller
+export interface CalibrationChange {
   label: string;
   value: number;
   sourceA2l?: string; // which A2L to use for this change

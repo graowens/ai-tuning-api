@@ -13,6 +13,52 @@ export interface BinaryDifference {
   file2Hex: string;
   file1Binary: string;
   file2Binary: string;
+  a2lContext?: A2lContext;
+}
+
+export interface A2lContext {
+  calibrationLabel?: string;
+  description?: string;
+  physicalValue1?: number;
+  physicalValue2?: number;
+  unit?: string;
+  compuMethod?: string;
+  recordLayout?: string;
+  isWithinCalibration: boolean;
+  calibrationStartOffset?: number;
+  calibrationSize?: number;
+  sourceA2l?: string; // Which A2L file defined this calibration
+  availableInA2ls?: string[]; // All A2L files that define this calibration
+  searchedA2ls?: string[]; // A2L files that were searched (for unmatched changes)
+  primaryA2l?: string; // The primary A2L used for analysis
+}
+
+export interface A2lAnalysis {
+  calibrationsChanged: CalibrationChange[];
+  unknownChanges: number;
+  analysisSource: string;
+  searchedA2ls: string[];
+}
+
+export interface CalibrationChange {
+  label: string;
+  description?: string;
+  startOffset: number;
+  size: number;
+  changedBytes: number;
+  physicalBefore?: number;
+  physicalAfter?: number;
+  unit?: string;
+  changeType: 'value' | 'partial' | 'unknown';
+  sourceA2l?: string;
+}
+
+interface BinaryComparison {
+  sizesMatch: boolean;
+  percentageSame: number;
+  totalDifferences: number;
+  differences: BinaryDifference[];
+  a2lAnalysis?: A2lAnalysis;
 }
 
 export interface ComparisonResult {
@@ -26,12 +72,7 @@ export interface ComparisonResult {
     sha1: string;
     matches: any[];
   };
-  comparison: {
-    sizesMatch: boolean;
-    percentageSame: number;
-    totalDifferences: number;
-    differences: BinaryDifference[];
-  };
+  comparison: BinaryComparison;
 }
 
 @Injectable()
@@ -52,6 +93,25 @@ export class ComparisonService {
     // Compare binaries
     const comparison = this.performBinaryComparison(buf1, buf2);
 
+    // Get all unique A2L matches
+    const allA2lMatches = [...new Set([
+      ...file1Info.matches.map(m => m.a2lPath),
+      ...file2Info.matches.map(m => m.a2lPath)
+    ])];
+
+    // Enhance with A2L analysis if we have matches
+    const bestA2l = this.selectBestA2lForAnalysis(file1Info.matches, file2Info.matches);
+    if (bestA2l && allA2lMatches.length > 0) {
+      comparison.a2lAnalysis = await this.performA2lAnalysis(
+        buf1, buf2, comparison.differences, bestA2l, allA2lMatches
+      );
+
+      // Enhance individual differences with A2L context from all matched A2Ls
+      comparison.differences = await this.enhanceDifferencesWithA2l(
+        comparison.differences, bestA2l, allA2lMatches
+      );
+    }
+
     return {
       file1: file1Info,
       file2: file2Info,
@@ -70,7 +130,7 @@ export class ComparisonService {
     };
   }
 
-  private performBinaryComparison(buf1: Buffer, buf2: Buffer) {
+  private performBinaryComparison(buf1: Buffer, buf2: Buffer): BinaryComparison {
     const minSize = Math.min(buf1.length, buf2.length);
     const maxSize = Math.max(buf1.length, buf2.length);
 
@@ -86,7 +146,7 @@ export class ComparisonService {
         sameBytes++;
       } else {
         differences.push({
-          address: i, // file offset as address for now
+          address: i,
           fileOffset: i,
           file1Value: byte1,
           file2Value: byte2,
@@ -124,31 +184,191 @@ export class ComparisonService {
       sizesMatch: buf1.length === buf2.length,
       percentageSame: Math.round(percentageSame * 100) / 100,
       totalDifferences: differences.length,
-      differences: differences.slice(0, 1000) // Limit to first 1000 differences for performance
+      differences: differences.slice(0, 1000) // Limit for performance
     };
   }
 
-  // Add this method to ComparisonService
-  private async enhanceWithA2lAddresses(differences: BinaryDifference[], a2lMatches: any[]) {
-    if (!a2lMatches.length) return differences;
-
-    // Use the best matching A2L
-    const bestA2l = a2lMatches[0];
-    // TODO: Parse A2L memory segments to convert file offsets to ECU addresses
-
-    return differences.map(diff => ({
-      ...diff,
-      ecuAddress: this.fileOffsetToEcuAddress(diff.fileOffset, bestA2l.a2lPath)
-    }));
+  private selectBestA2lForAnalysis(matches1: any[], matches2: any[]): string | null {
+    // Prefer matches from file1, then file2, pick highest scoring
+    const allMatches = [...matches1, ...matches2].sort((a, b) => b.score - a.score);
+    return allMatches.length > 0 ? allMatches[0].a2lPath : null;
   }
 
-  private fileOffsetToEcuAddress(fileOffset: number, a2lPath: string): number {
-    // TODO: Implement A2L memory segment parsing
-    // For now, return file offset as placeholder
-    return fileOffset;
+  private async performA2lAnalysis(
+    buf1: Buffer,
+    buf2: Buffer,
+    differences: BinaryDifference[],
+    a2lPath: string,
+    allA2lMatches: string[]
+  ): Promise<A2lAnalysis> {
+    // Parse all A2L files
+    const allCalibrations = new Map<string, any[]>();
+    for (const a2l of allA2lMatches) {
+      allCalibrations.set(a2l, await this.parseA2lCalibrations(a2l));
+    }
+
+    const calibrationsChanged: CalibrationChange[] = [];
+    let unknownChanges = 0;
+
+    // Group differences by calibration across all A2Ls
+    const calibrationDiffs = new Map<string, { diffs: BinaryDifference[], sourceA2l: string, cal: any }>();
+
+    for (const diff of differences) {
+      let found = false;
+
+      // Search in primary A2L first, then others
+      const searchOrder = [a2lPath, ...allA2lMatches.filter(a => a !== a2lPath)];
+
+      for (const searchA2l of searchOrder) {
+        const calibrations = allCalibrations.get(searchA2l) || [];
+        const cal = this.findCalibrationForOffset(diff.fileOffset, calibrations);
+
+        if (cal) {
+          const key = `${cal.label}_${searchA2l}`;
+          if (!calibrationDiffs.has(key)) {
+            calibrationDiffs.set(key, { diffs: [], sourceA2l: searchA2l, cal });
+          }
+          calibrationDiffs.get(key)!.diffs.push(diff);
+          found = true;
+          break;
+        }
+      }
+
+      if (!found) {
+        unknownChanges++;
+      }
+    }
+
+    // Analyze each changed calibration
+    for (const [key, { diffs, sourceA2l, cal }] of calibrationDiffs) {
+      const change: CalibrationChange = {
+        label: cal.label,
+        description: cal.description,
+        startOffset: cal.fileOffset,
+        size: cal.sizeBytes,
+        changedBytes: diffs.length,
+        changeType: this.determineChangeType(diffs, cal),
+        unit: cal.unit,
+        sourceA2l: sourceA2l
+      };
+
+      // Try to calculate physical values if it's a simple value change
+      if (change.changeType === 'value' && cal.compuMethod) {
+        change.physicalBefore = this.rawToPhysical(
+          this.readCalibrationValue(buf1, cal), cal.compuMethod
+        );
+        change.physicalAfter = this.rawToPhysical(
+          this.readCalibrationValue(buf2, cal), cal.compuMethod
+        );
+      }
+
+      calibrationsChanged.push(change);
+    }
+
+    return {
+      calibrationsChanged,
+      unknownChanges,
+      analysisSource: a2lPath,
+      searchedA2ls: allA2lMatches
+    };
   }
 
+  private async enhanceDifferencesWithA2l(
+    differences: BinaryDifference[],
+    a2lPath: string,
+    allA2lMatches: string[]
+  ): Promise<BinaryDifference[]> {
+    // Parse all A2L files
+    const allCalibrations = new Map<string, any[]>();
+    for (const a2l of allA2lMatches) {
+      allCalibrations.set(a2l, await this.parseA2lCalibrations(a2l));
+    }
 
+    return differences.map(diff => {
+      // Search in primary A2L first, then others
+      const searchOrder = [a2lPath, ...allA2lMatches.filter(a => a !== a2lPath)];
+
+      for (const searchA2l of searchOrder) {
+        const calibrations = allCalibrations.get(searchA2l) || [];
+        const cal = this.findCalibrationForOffset(diff.fileOffset, calibrations);
+
+        if (cal) {
+          const a2lContext: A2lContext = {
+            calibrationLabel: cal.label,
+            description: cal.description,
+            unit: cal.unit,
+            compuMethod: cal.compuMethod?.kind || 'unknown',
+            recordLayout: cal.recordLayout,
+            isWithinCalibration: true,
+            calibrationStartOffset: cal.fileOffset,
+            calibrationSize: cal.sizeBytes,
+            sourceA2l: searchA2l,
+            availableInA2ls: this.findA2lsContainingCalibration(cal.label, allCalibrations),
+            primaryA2l: a2lPath
+          };
+
+          // Try to convert to physical values if possible
+          if (cal.compuMethod && cal.sizeBytes <= 4) {
+            try {
+              a2lContext.physicalValue1 = this.rawToPhysical(diff.file1Value, cal.compuMethod);
+              a2lContext.physicalValue2 = this.rawToPhysical(diff.file2Value, cal.compuMethod);
+            } catch {
+              // Ignore conversion errors
+            }
+          }
+
+          return { ...diff, a2lContext };
+        }
+      }
+
+      // Not found in any A2L
+      return {
+        ...diff,
+        a2lContext: {
+          isWithinCalibration: false,
+          searchedA2ls: allA2lMatches,
+          primaryA2l: a2lPath
+        }
+      };
+    });
+  }
+
+  private findA2lsContainingCalibration(label: string, allCalibrations: Map<string, any[]>): string[] {
+    const result: string[] = [];
+    for (const [a2lPath, calibrations] of allCalibrations) {
+      if (calibrations.some(cal => cal.label === label)) {
+        result.push(a2lPath);
+      }
+    }
+    return result;
+  }
+
+  // Stub implementations - you'll need to implement these based on A2L parsing
+  private async parseA2lCalibrations(a2lPath: string): Promise<any[]> {
+    // TODO: Parse A2L CHARACTERISTIC blocks
+    // Return array of: { label, fileOffset, sizeBytes, description, unit, compuMethod, recordLayout }
+    return [];
+  }
+
+  private findCalibrationForOffset(offset: number, calibrations: any[]): any | null {
+    return calibrations.find(cal =>
+      offset >= cal.fileOffset && offset < cal.fileOffset + cal.sizeBytes
+    ) || null;
+  }
+
+  private determineChangeType(diffs: BinaryDifference[], calibration: any): 'value' | 'partial' | 'unknown' {
+    if (diffs.length === calibration.sizeBytes) return 'value';
+    if (diffs.length < calibration.sizeBytes) return 'partial';
+    return 'unknown';
+  }
+
+  private readCalibrationValue(buf: Buffer, calibration: any): number {
+    // TODO: Read multi-byte value respecting byte order
+    return buf[calibration.fileOffset];
+  }
+
+  private rawToPhysical(rawValue: number, compuMethod: any): number {
+    // TODO: Implement COMPU_METHOD conversion
+    return rawValue;
+  }
 }
-
-
